@@ -1,0 +1,468 @@
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+
+const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
+const ROOT = __dirname;
+const STORAGE_DIR = process.env.STORAGE_DIR ? path.resolve(process.env.STORAGE_DIR) : ROOT;
+const DATA_FILE = path.join(STORAGE_DIR, 'data.json');
+const RAZORPAY_CONFIG_FILE = path.join(ROOT, 'razorpay-config.json');
+const MAX_BODY_SIZE = 20_000_000;
+const UPLOADS_DIR = path.join(STORAGE_DIR, 'uploads');
+const RENDERS_DIR = path.join(STORAGE_DIR, 'tmp', 'pdf-pages');
+const POPPLER_BIN_DIR = path.join(process.env.USERPROFILE || '', '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'native', 'poppler', 'Library', 'bin');
+const PDFINFO_BIN = fs.existsSync(path.join(POPPLER_BIN_DIR, 'pdfinfo.exe')) ? path.join(POPPLER_BIN_DIR, 'pdfinfo.exe') : 'pdfinfo';
+const PDFTOPPM_BIN = fs.existsSync(path.join(POPPLER_BIN_DIR, 'pdftoppm.exe')) ? path.join(POPPLER_BIN_DIR, 'pdftoppm.exe') : 'pdftoppm';
+const razorpayConfig = readRazorpayConfig();
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || razorpayConfig.keyId || '';
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || razorpayConfig.keySecret || '';
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function ensureStorageReady() {
+  ensureDir(STORAGE_DIR);
+  ensureDir(UPLOADS_DIR);
+  ensureDir(path.dirname(RENDERS_DIR));
+}
+
+function readRazorpayConfig() {
+  if (!fs.existsSync(RAZORPAY_CONFIG_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(RAZORPAY_CONFIG_FILE, 'utf8')); }
+  catch { return {}; }
+}
+
+function readData() {
+  if (!fs.existsSync(DATA_FILE)) return { users: [], sessions: {}, notes: [], payments: [], paymentOrders: [] };
+  try { const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); data.users ||= []; data.sessions ||= {}; data.notes ||= []; data.payments ||= []; data.paymentOrders ||= []; if (!data.users.some(user => user.isAdmin) && data.users[0] && !IS_PRODUCTION && !ADMIN_EMAIL) { data.users[0].isAdmin = true; fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8'); } return data; }
+  catch { return { users: [], sessions: {}, notes: [], payments: [], paymentOrders: [] }; }
+}
+function writeData(data) { ensureStorageReady(); fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8'); }
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') };
+}
+function passwordIsValid(password, user) {
+  const candidate = crypto.scryptSync(password, user.salt, 64).toString('hex');
+  return crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.passwordHash, 'hex'));
+}
+function parseCookies(req) {
+  return Object.fromEntries((req.headers.cookie || '').split(';').filter(Boolean).map(x => {
+    const i = x.indexOf('='); return [x.slice(0, i).trim(), decodeURIComponent(x.slice(i + 1))];
+  }));
+}
+function send(res, status, body, headers = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...headers });
+  res.end(JSON.stringify(body));
+}
+function publicUser(user) { return { id: user.id, name: user.name, email: user.email, library: user.library || [], isAdmin: !!user.isAdmin }; }
+function publicNote(note) {
+  return {
+    id: note.id,
+    course: note.course,
+    year: note.year,
+    subject: note.subject,
+    title: note.title,
+    price: note.price,
+    fileName: note.fileName,
+    mimeType: note.mimeType,
+    pageCount: note.pageCount || (note.mimeType === 'application/pdf' ? null : 1),
+    uploadedAt: note.uploadedAt
+  };
+}
+function publicPayment(payment, data) {
+  const buyer = data.users.find(user => user.id === payment.userId);
+  return {
+    id: payment.id,
+    buyerName: buyer ? buyer.name : payment.buyerName || 'Unknown user',
+    buyerEmail: buyer ? buyer.email : payment.buyerEmail || '',
+    noteTitle: payment.title,
+    course: payment.course,
+    year: payment.year,
+    subject: payment.subject,
+    amount: payment.amount,
+    provider: payment.provider,
+    status: payment.status,
+    purchasedAt: payment.purchasedAt
+  };
+}
+function publicPaymentConfig() {
+  return {
+    provider: 'razorpay',
+    keyId: RAZORPAY_KEY_ID,
+    enabled: Boolean(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET)
+  };
+}
+function computeAdminFlag(email, data) {
+  if (ADMIN_EMAIL) return email === ADMIN_EMAIL;
+  return !IS_PRODUCTION && !data.users.some(item => item.isAdmin);
+}
+function currentUser(req, data) {
+  const token = parseCookies(req).inkly_session;
+  const session = token && data.sessions[token];
+  if (!session || session.expiresAt < Date.now()) return null;
+  return data.users.find(user => user.id === session.userId) || null;
+}
+function sessionCookie(token) { return `inkly_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${IS_PRODUCTION ? '; Secure' : ''}`; }
+function clearCookie() { return `inkly_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${IS_PRODUCTION ? '; Secure' : ''}`; }
+function createSession(data, userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  data.sessions[token] = { userId, expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 };
+  return token;
+}
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > MAX_BODY_SIZE) req.destroy(); });
+    req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch { reject(new Error('Invalid request body')); } });
+    req.on('error', reject);
+  });
+}
+function validPassword(password) { return typeof password === 'string' && /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/.test(password); }
+function validEmail(email) { return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email); }
+function noteFilePath(note) { return path.join(UPLOADS_DIR, `${note.id}${note.extension}`); }
+function ownsNote(user, note) {
+  if (!user || !note) return false;
+  if (user.isAdmin) return true;
+  return (user.library || []).some(item => item.noteId === note.id || (!item.noteId && item.course === note.course && item.year === note.year && item.subject === note.subject));
+}
+function safeFileName(name) { return String(name || 'notes.pdf').replace(/["\r\n]/g, ''); }
+function activeSessions(data) {
+  const now = Date.now();
+  return Object.values(data.sessions).filter(session => session && session.expiresAt > now);
+}
+function hydrateLegacyPayments(data) {
+  let changed = false;
+  const known = new Set(data.payments.map(payment => `${payment.userId}|${payment.noteId || ''}|${payment.purchasedAt || ''}`));
+  for (const user of data.users) {
+    for (const item of user.library || []) {
+      const note = item.noteId
+        ? data.notes.find(candidate => candidate.id === item.noteId)
+        : data.notes.find(candidate => candidate.course === item.course && candidate.year === item.year && candidate.subject === item.subject);
+      const purchasedAt = item.purchasedAt || note?.uploadedAt;
+      if (!note || !purchasedAt) continue;
+      const key = `${user.id}|${note.id}|${purchasedAt}`;
+      if (known.has(key)) continue;
+      data.payments.push({
+        id: crypto.randomUUID(),
+        userId: user.id,
+        noteId: note.id,
+        title: note.title,
+        course: note.course,
+        year: note.year,
+        subject: note.subject,
+        amount: Number(item.price ?? note.price ?? 0),
+        provider: 'inkly-local',
+        status: 'paid',
+        purchasedAt
+      });
+      known.add(key);
+      changed = true;
+    }
+  }
+  if (changed) writeData(data);
+}
+function razorpayRequest(endpoint, payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const request = https.request({
+      method: 'POST',
+      hostname: 'api.razorpay.com',
+      path: endpoint,
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString('base64')}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, response => {
+      let chunks = '';
+      response.on('data', chunk => { chunks += chunk; });
+      response.on('end', () => {
+        let parsed;
+        try { parsed = JSON.parse(chunks || '{}'); } catch { parsed = { error: { description: 'Invalid Razorpay response.' } }; }
+        if (response.statusCode && response.statusCode >= 200 && response.statusCode < 300) return resolve(parsed);
+        reject(new Error(parsed.error?.description || 'Razorpay request failed.'));
+      });
+    });
+    request.on('error', reject);
+    request.write(body);
+    request.end();
+  });
+}
+function readPdfPageCount(note) {
+  try {
+    const output = execFileSync(PDFINFO_BIN, [noteFilePath(note)], { encoding: 'utf8', windowsHide: true });
+    const match = output.match(/Pages:\s+(\d+)/);
+    return match ? Number(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+function hydrateNoteMetadata(data) {
+  let changed = false;
+  for (const note of data.notes) {
+    const nextPageCount = note.mimeType === 'application/pdf' ? readPdfPageCount(note) : 1;
+    if (nextPageCount && note.pageCount !== nextPageCount) {
+      note.pageCount = nextPageCount;
+      changed = true;
+    }
+  }
+  if (changed) writeData(data);
+}
+function renderPdfPage(note, pageNumber) {
+  fs.mkdirSync(RENDERS_DIR, { recursive: true });
+  const prefix = path.join(RENDERS_DIR, `${note.id}-page-${pageNumber}`);
+  const pngFile = `${prefix}.png`;
+  if (!fs.existsSync(pngFile)) {
+    execFileSync(PDFTOPPM_BIN, ['-f', String(pageNumber), '-l', String(pageNumber), '-singlefile', '-png', '-r', '144', noteFilePath(note), prefix], { windowsHide: true });
+  }
+  return pngFile;
+}
+
+async function api(req, res) {
+  const data = readData();
+  hydrateLegacyPayments(data);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const user = currentUser(req, data);
+  if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, environment: NODE_ENV });
+  if (req.method === 'GET' && url.pathname === '/api/me') return send(res, 200, { user: user ? publicUser(user) : null });
+  if (req.method === 'POST' && url.pathname === '/api/signup') {
+    const { name, email, password } = await readJson(req); const normalized = String(email || '').trim().toLowerCase();
+    if (!String(name || '').trim() || !validEmail(normalized) || !validPassword(password)) return send(res, 400, { error: 'Enter a name, valid email and a strong password.' });
+    if (data.users.some(item => item.email === normalized)) return send(res, 409, { error: 'An account already exists with this email.' });
+    const secure = hashPassword(password); const newUser = { id: crypto.randomUUID(), name: String(name).trim(), email: normalized, passwordHash: secure.hash, salt: secure.salt, library: [], isAdmin: computeAdminFlag(normalized, data) };
+    data.users.push(newUser); const token = createSession(data, newUser.id); writeData(data);
+    return send(res, 201, { user: publicUser(newUser) }, { 'Set-Cookie': sessionCookie(token) });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/login') {
+    const { email, password } = await readJson(req); const found = data.users.find(item => item.email === String(email || '').trim().toLowerCase());
+    if (!found || !passwordIsValid(String(password || ''), found)) return send(res, 401, { error: 'Incorrect email or password.' });
+    const token = createSession(data, found.id); writeData(data); return send(res, 200, { user: publicUser(found) }, { 'Set-Cookie': sessionCookie(token) });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/reset-password') {
+    const { email, password } = await readJson(req);
+    const found = data.users.find(item => item.email === String(email || '').trim().toLowerCase());
+    if (!found) return send(res, 404, { error: 'No account was found with this email.' });
+    if (!validPassword(password)) return send(res, 400, { error: 'Use 8+ characters with uppercase, lowercase and a number.' });
+    const secure = hashPassword(password); found.passwordHash = secure.hash; found.salt = secure.salt;
+    const token = createSession(data, found.id); writeData(data);
+    return send(res, 200, { user: publicUser(found) }, { 'Set-Cookie': sessionCookie(token) });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/logout') {
+    const token = parseCookies(req).inkly_session; if (token) delete data.sessions[token]; writeData(data);
+    return send(res, 200, { ok: true }, { 'Set-Cookie': clearCookie() });
+  }
+  if (!user) return send(res, 401, { error: 'Please log in to continue.' });
+  if (req.method === 'GET' && url.pathname === '/api/payments/razorpay/config') return send(res, 200, publicPaymentConfig());
+  if (req.method === 'GET' && url.pathname === '/api/notes') {
+    hydrateNoteMetadata(data);
+    return send(res, 200, { notes: data.notes.map(publicNote) });
+  }
+  const fileMatch = url.pathname.match(/^\/api\/notes\/([^/]+)\/file$/);
+  const pageMatch = url.pathname.match(/^\/api\/notes\/([^/]+)\/pages\/(\d+)$/);
+  if (req.method === 'GET' && fileMatch) {
+    const note = data.notes.find(item => item.id === decodeURIComponent(fileMatch[1]));
+    if (!note) return send(res, 404, { error: 'Note not found.' });
+    const previewOnly = url.searchParams.get('preview') === '1';
+    if (!previewOnly && !ownsNote(user, note)) return send(res, 403, { error: 'Purchase these notes before opening the full file.' });
+    const file = noteFilePath(note);
+    if (!fs.existsSync(file)) return send(res, 404, { error: 'Uploaded file is missing.' });
+    res.writeHead(200, {
+      'Content-Type': note.mimeType,
+      'Content-Disposition': `inline; filename="${safeFileName(note.fileName)}"`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff'
+    });
+    return fs.createReadStream(file).pipe(res);
+  }
+  if (req.method === 'GET' && pageMatch) {
+    const note = data.notes.find(item => item.id === decodeURIComponent(pageMatch[1]));
+    if (!note) return send(res, 404, { error: 'Note not found.' });
+    if (note.mimeType !== 'application/pdf') return send(res, 400, { error: 'Rendered pages are available only for PDFs.' });
+    const previewOnly = url.searchParams.get('preview') === '1';
+    if (!previewOnly && !ownsNote(user, note)) return send(res, 403, { error: 'Purchase these notes before opening the full file.' });
+    hydrateNoteMetadata(data);
+    const pageNumber = Number(pageMatch[2]);
+    const pageCount = note.pageCount || 1;
+    if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > pageCount) return send(res, 404, { error: 'Page not found.' });
+    if (previewOnly && !ownsNote(user, note) && pageNumber > 5) return send(res, 403, { error: 'Only the first 5 preview pages are available before purchase.' });
+    const renderedPage = renderPdfPage(note, pageNumber);
+    res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    return fs.createReadStream(renderedPage).pipe(res);
+  }
+  if (req.method === 'GET' && url.pathname === '/api/admin/notes') {
+    if (!user.isAdmin) return send(res, 403, { error: 'Developer access is required.' });
+    hydrateNoteMetadata(data);
+    return send(res, 200, { notes: data.notes.map(publicNote) });
+  }
+  if (req.method === 'GET' && url.pathname === '/api/admin/dashboard') {
+    if (!user.isAdmin) return send(res, 403, { error: 'Developer access is required.' });
+    hydrateNoteMetadata(data);
+    const sessions = activeSessions(data);
+    const activeUserIds = [...new Set(sessions.map(session => session.userId))];
+    const activeUsers = activeUserIds.map(id => data.users.find(candidate => candidate.id === id)).filter(Boolean).map(activeUser => ({
+      id: activeUser.id,
+      name: activeUser.name,
+      email: activeUser.email,
+      libraryCount: (activeUser.library || []).length
+    }));
+    const payments = [...data.payments].sort((a, b) => new Date(b.purchasedAt).getTime() - new Date(a.purchasedAt).getTime());
+    const revenue = payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+    return send(res, 200, {
+      metrics: {
+        totalUsers: data.users.length,
+        activeUsers: activeUsers.length,
+        activeSessions: sessions.length,
+        totalNotes: data.notes.length,
+        totalPayments: payments.length,
+        revenue
+      },
+      activeUsers,
+      payments: payments.map(payment => publicPayment(payment, data))
+    });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/admin/notes') {
+    if (!user.isAdmin) return send(res, 403, { error: 'Developer access is required.' });
+    const { course, year, subject, title, price, fileName, mimeType, fileData } = await readJson(req);
+    if (![course, year, subject, title, fileName, fileData].every(value => typeof value === 'string' && value.trim())) return send(res, 400, { error: 'Complete all note details and choose a file.' });
+    if (!['MBBS', 'BDS'].includes(course) || !/^Year [1-4]$/.test(year) || !Number.isFinite(Number(price)) || Number(price) < 0) return send(res, 400, { error: 'Enter valid course, year and price information.' });
+    if (!['application/pdf', 'image/jpeg', 'image/png'].includes(mimeType)) return send(res, 400, { error: 'Upload a PDF, JPG or PNG file.' });
+    const bytes = Buffer.from(fileData, 'base64'); if (!bytes.length || bytes.length > 15_000_000) return send(res, 400, { error: 'The note file must be under 15 MB.' });
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true }); const id = crypto.randomUUID(); const extension = mimeType === 'application/pdf' ? '.pdf' : mimeType === 'image/png' ? '.png' : '.jpg';
+    const storedFile = path.join(UPLOADS_DIR, `${id}${extension}`);
+    fs.writeFileSync(storedFile, bytes);
+    const note = { id, course, year, subject, title, price: Number(price), fileName, mimeType, extension, pageCount: mimeType === 'application/pdf' ? null : 1, uploadedBy: user.id, uploadedAt: new Date().toISOString() };
+    if (mimeType === 'application/pdf') note.pageCount = readPdfPageCount(note);
+    data.notes.unshift(note); writeData(data);
+    return send(res, 201, { note: publicNote(note) });
+  }
+  if (req.method === 'PATCH' && url.pathname === '/api/profile') {
+    const { name } = await readJson(req); if (!String(name || '').trim()) return send(res, 400, { error: 'A display name is required.' });
+    user.name = String(name).trim(); writeData(data); return send(res, 200, { user: publicUser(user) });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/purchases') {
+    const { noteId } = await readJson(req);
+    const note = data.notes.find(item => item.id === String(noteId || '').trim());
+    if (!note) return send(res, 404, { error: 'Choose an uploaded note before checkout.' });
+    user.library ||= [];
+    const existing = user.library.find(item => item.noteId === note.id || (!item.noteId && item.course === note.course && item.year === note.year && item.subject === note.subject));
+    if (existing) Object.assign(existing, { noteId: note.id, title: note.title, price: note.price });
+    else user.library.push({ noteId: note.id, course: note.course, year: note.year, subject: note.subject, title: note.title, price: note.price, purchasedAt: new Date().toISOString() });
+    const purchasedAt = existing?.purchasedAt || user.library.find(item => item.noteId === note.id)?.purchasedAt || new Date().toISOString();
+    if (!data.payments.some(payment => payment.userId === user.id && payment.noteId === note.id && payment.purchasedAt === purchasedAt)) {
+      data.payments.unshift({
+        id: crypto.randomUUID(),
+        userId: user.id,
+        noteId: note.id,
+        title: note.title,
+        course: note.course,
+        year: note.year,
+        subject: note.subject,
+        amount: Number(note.price || 0),
+        provider: 'inkly-local',
+        status: 'paid',
+        purchasedAt
+      });
+    }
+    writeData(data); return send(res, 200, { library: user.library });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/payments/razorpay/order') {
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) return send(res, 400, { error: 'Razorpay is not fully configured yet. Add the Razorpay Key Secret on the server.' });
+    const { noteId } = await readJson(req);
+    const note = data.notes.find(item => item.id === String(noteId || '').trim());
+    if (!note) return send(res, 404, { error: 'Choose an uploaded note before checkout.' });
+    const existingPurchase = (user.library || []).find(item => item.noteId === note.id || (!item.noteId && item.course === note.course && item.year === note.year && item.subject === note.subject));
+    if (existingPurchase) return send(res, 409, { error: 'You already own these notes.' });
+    const amount = Math.round(Number(note.price || 0) * 100);
+    if (!amount) return send(res, 400, { error: 'This note does not have a valid payment amount yet.' });
+    const razorpayOrder = await razorpayRequest('/v1/orders', {
+      amount,
+      currency: 'INR',
+      receipt: `inkly_${Date.now()}`,
+      notes: {
+        note_id: note.id,
+        course: note.course,
+        subject: note.subject
+      }
+    });
+    data.paymentOrders.unshift({
+      id: crypto.randomUUID(),
+      userId: user.id,
+      noteId: note.id,
+      razorpayOrderId: razorpayOrder.id,
+      amount,
+      currency: razorpayOrder.currency || 'INR',
+      status: razorpayOrder.status || 'created',
+      createdAt: new Date().toISOString()
+    });
+    writeData(data);
+    return send(res, 200, {
+      keyId: RAZORPAY_KEY_ID,
+      razorpayOrderId: razorpayOrder.id,
+      amount,
+      currency: razorpayOrder.currency || 'INR',
+      note: publicNote(note)
+    });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/payments/razorpay/verify') {
+    if (!RAZORPAY_KEY_SECRET) return send(res, 400, { error: 'Razorpay Key Secret is missing on the server.' });
+    const { noteId, razorpay_payment_id, razorpay_order_id, razorpay_signature } = await readJson(req);
+    const note = data.notes.find(item => item.id === String(noteId || '').trim());
+    if (!note) return send(res, 404, { error: 'Note not found.' });
+    const orderRecord = data.paymentOrders.find(order => order.userId === user.id && order.noteId === note.id && order.razorpayOrderId === String(razorpay_order_id || '').trim());
+    if (!orderRecord) return send(res, 404, { error: 'Payment order not found.' });
+    const expected = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET).update(`${orderRecord.razorpayOrderId}|${String(razorpay_payment_id || '').trim()}`).digest('hex');
+    const received = String(razorpay_signature || '').trim();
+    if (expected.length !== received.length || !crypto.timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(received, 'utf8'))) {
+      return send(res, 400, { error: 'Razorpay signature verification failed.' });
+    }
+    user.library ||= [];
+    const existing = user.library.find(item => item.noteId === note.id || (!item.noteId && item.course === note.course && item.year === note.year && item.subject === note.subject));
+    const purchasedAt = new Date().toISOString();
+    if (existing) Object.assign(existing, { noteId: note.id, title: note.title, price: note.price, purchasedAt });
+    else user.library.push({ noteId: note.id, course: note.course, year: note.year, subject: note.subject, title: note.title, price: note.price, purchasedAt });
+    orderRecord.status = 'paid';
+    orderRecord.razorpayPaymentId = String(razorpay_payment_id || '').trim();
+    orderRecord.verifiedAt = purchasedAt;
+    if (!data.payments.some(payment => payment.userId === user.id && payment.noteId === note.id && payment.razorpayPaymentId === orderRecord.razorpayPaymentId)) {
+      data.payments.unshift({
+        id: crypto.randomUUID(),
+        userId: user.id,
+        noteId: note.id,
+        title: note.title,
+        course: note.course,
+        year: note.year,
+        subject: note.subject,
+        amount: Number(note.price || 0),
+        provider: 'razorpay',
+        status: 'paid',
+        purchasedAt,
+        razorpayOrderId: orderRecord.razorpayOrderId,
+        razorpayPaymentId: orderRecord.razorpayPaymentId
+      });
+    }
+    writeData(data);
+    return send(res, 200, { library: user.library });
+  }
+  return send(res, 404, { error: 'Not found.' });
+}
+
+const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+ensureStorageReady();
+const server = http.createServer(async (req, res) => {
+  try {
+    if (req.url === '/health' || req.url.startsWith('/api/')) return await api(req, res);
+    const requested = req.url === '/' ? '/index.html' : new URL(req.url, 'http://localhost').pathname;
+    if (requested.startsWith('/uploads/')) return res.writeHead(404).end('Not found');
+    const file = path.resolve(ROOT, `.${requested}`);
+    if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return res.writeHead(404).end('Not found');
+    res.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' }); fs.createReadStream(file).pipe(res);
+  } catch (error) { send(res, 500, { error: error.message || 'Server error.' }); }
+});
+server.listen(PORT, () => console.log(`Inkly server listening on port ${PORT} (${NODE_ENV})`));

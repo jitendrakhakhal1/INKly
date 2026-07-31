@@ -1,0 +1,12 @@
+{
+  "name": "inkly-notes",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Handwritten medical notes marketplace with secure in-app preview and Razorpay checkout",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}

@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: inkly-notes
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+      - key: STORAGE_DIR
+        value: /app/storage
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+    disk:
+      name: inkly-storage
+      mountPath: /app/storage
+      sizeGB: 1
