@@ -99,6 +99,15 @@ function publicPaymentConfig() {
     enabled: Boolean(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET)
   };
 }
+function syncAdminAccess(user, data) {
+  if (!user || !ADMIN_EMAIL) return false;
+  if (user.email === ADMIN_EMAIL && !user.isAdmin) {
+    user.isAdmin = true;
+    writeData(data);
+    return true;
+  }
+  return false;
+}
 function computeAdminFlag(email, data) {
   if (ADMIN_EMAIL) return email === ADMIN_EMAIL;
   return !IS_PRODUCTION && !data.users.some(item => item.isAdmin);
@@ -107,7 +116,9 @@ function currentUser(req, data) {
   const token = parseCookies(req).inkly_session;
   const session = token && data.sessions[token];
   if (!session || session.expiresAt < Date.now()) return null;
-  return data.users.find(user => user.id === session.userId) || null;
+  const user = data.users.find(item => item.id === session.userId) || null;
+  syncAdminAccess(user, data);
+  return user;
 }
 function sessionCookie(token) { return `inkly_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${IS_PRODUCTION ? '; Secure' : ''}`; }
 function clearCookie() { return `inkly_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${IS_PRODUCTION ? '; Secure' : ''}`; }
@@ -243,6 +254,7 @@ async function api(req, res) {
   if (req.method === 'POST' && url.pathname === '/api/login') {
     const { email, password } = await readJson(req); const found = data.users.find(item => item.email === String(email || '').trim().toLowerCase());
     if (!found || !passwordIsValid(String(password || ''), found)) return send(res, 401, { error: 'Incorrect email or password.' });
+    syncAdminAccess(found, data);
     const token = createSession(data, found.id); writeData(data); return send(res, 200, { user: publicUser(found) }, { 'Set-Cookie': sessionCookie(token) });
   }
   if (req.method === 'POST' && url.pathname === '/api/reset-password') {
@@ -251,6 +263,7 @@ async function api(req, res) {
     if (!found) return send(res, 404, { error: 'No account was found with this email.' });
     if (!validPassword(password)) return send(res, 400, { error: 'Use 8+ characters with uppercase, lowercase and a number.' });
     const secure = hashPassword(password); found.passwordHash = secure.hash; found.salt = secure.salt;
+    syncAdminAccess(found, data);
     const token = createSession(data, found.id); writeData(data);
     return send(res, 200, { user: publicUser(found) }, { 'Set-Cookie': sessionCookie(token) });
   }
