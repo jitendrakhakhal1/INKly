@@ -110,6 +110,10 @@ const curriculum = {
   }
 };
 
+function subjectOptionsFor(course, year) {
+  return (curriculum[course]?.[year] || []).map(([name]) => name);
+}
+
 async function request(url, options = {}) {
   const response = await fetch(url, {
     credentials: 'same-origin',
@@ -717,6 +721,7 @@ async function saveProfile() {
 function developer() {
   if (!state.isAdmin) return `<div class="shell screen-animate">${nav()}<section class="content"><h1 class="heading">Developer access required.</h1></section></div>`;
   setTimeout(loadDeveloperPortal, 0);
+  setTimeout(updateUploadSubjects, 0);
   return `<div class="shell screen-animate">${nav()}<section class="content">
     <div class="eyebrow">Developer portal</div>
     <h1 class="heading">Upload a note set.</h1>
@@ -743,11 +748,11 @@ function developer() {
     </section>
     <form class="pay-card upload-form" onsubmit="uploadNote(event)">
       <div class="upload-grid">
-        <div><label class="field">Course</label><select class="input" id="upload-course"><option>MBBS</option><option>BDS</option></select></div>
-        <div><label class="field">Year</label><select class="input" id="upload-year"><option>Year 1</option><option>Year 2</option><option>Year 3</option><option>Year 4</option></select></div>
+        <div><label class="field">Course</label><select class="input" id="upload-course" onchange="updateUploadSubjects()"><option>MBBS</option><option>BDS</option></select></div>
+        <div><label class="field">Year</label><select class="input" id="upload-year" onchange="updateUploadSubjects()"><option>Year 1</option><option>Year 2</option><option>Year 3</option><option>Year 4</option></select></div>
       </div>
       <label class="field">Subject</label>
-      <input class="input" id="upload-subject" placeholder="e.g. General Medicine" required>
+      <select class="input" id="upload-subject" required></select>
       <label class="field">Note title</label>
       <input class="input" id="upload-title" placeholder="e.g. HIV - Complete Notes" required>
       <label class="field">Price (Rs)</label>
@@ -791,7 +796,19 @@ async function loadDeveloperPortal() {
 async function refreshDeveloperPortal() {
   await loadNotes();
   await loadDeveloperPortal();
+  updateUploadSubjects();
   toast('Developer dashboard refreshed.');
+}
+
+function updateUploadSubjects() {
+  const courseSelect = document.querySelector('#upload-course');
+  const yearSelect = document.querySelector('#upload-year');
+  const subjectSelect = document.querySelector('#upload-subject');
+  if (!courseSelect || !yearSelect || !subjectSelect) return;
+  const previous = subjectSelect.value;
+  const subjects = subjectOptionsFor(courseSelect.value, yearSelect.value);
+  subjectSelect.innerHTML = subjects.map(subject => `<option value="${escapeHtml(subject)}">${escapeHtml(subject)}</option>`).join('');
+  if (subjects.includes(previous)) subjectSelect.value = previous;
 }
 
 async function uploadNote(event) {
@@ -826,6 +843,7 @@ async function uploadNote(event) {
     });
     toast('Notes uploaded successfully.');
     event.target.reset();
+    updateUploadSubjects();
     await loadNotes();
     await loadDeveloperPortal();
   } catch (error) {

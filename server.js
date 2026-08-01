@@ -24,6 +24,20 @@ const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || razorpayConfig.keyId || '
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || razorpayConfig.keySecret || '';
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const COURSE_SUBJECTS = {
+  MBBS: {
+    'Year 1': ['Anatomy', 'Physiology', 'Biochemistry'],
+    'Year 2': ['Pathology', 'Pharmacology', 'Microbiology', 'Forensic Medicine'],
+    'Year 3': ['Community Medicine', 'Ophthalmology', 'ENT'],
+    'Year 4': ['General Medicine', 'General Surgery', 'Paediatrics', 'Obstetrics & Gynaecology']
+  },
+  BDS: {
+    'Year 1': ['General Anatomy', 'General Physiology', 'Biochemistry', 'Dental Anatomy'],
+    'Year 2': ['General Pathology', 'General Pharmacology', 'Dental Materials', 'Preclinical Prosthodontics'],
+    'Year 3': ['General Medicine', 'General Surgery', 'Oral Pathology & Microbiology'],
+    'Year 4': ['Oral Medicine & Radiology', 'Paediatric & Preventive Dentistry', 'Orthodontics & Dentofacial Orthopaedics', 'Periodontology']
+  }
+};
 const pdfRenderJobs = new Map();
 
 function ensureDir(dir) {
@@ -48,6 +62,46 @@ function readData() {
   catch { return { users: [], sessions: {}, notes: [], payments: [], paymentOrders: [] }; }
 }
 function writeData(data) { ensureStorageReady(); fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8'); }
+function normalizeLabel(value) { return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase(); }
+function canonicalSubject(course, year, subject) {
+  const subjects = COURSE_SUBJECTS[course]?.[year] || [];
+  const normalized = normalizeLabel(subject);
+  return subjects.find(item => normalizeLabel(item) === normalized) || '';
+}
+function hydrateCurriculumSubjects(data) {
+  let changed = false;
+  for (const note of data.notes || []) {
+    const canonical = canonicalSubject(note.course, note.year, note.subject);
+    if (canonical && note.subject !== canonical) {
+      note.subject = canonical;
+      changed = true;
+    }
+  }
+  for (const user of data.users || []) {
+    for (const item of user.library || []) {
+      const canonical = canonicalSubject(item.course, item.year, item.subject);
+      if (canonical && item.subject !== canonical) {
+        item.subject = canonical;
+        changed = true;
+      }
+    }
+  }
+  for (const payment of data.payments || []) {
+    const canonical = canonicalSubject(payment.course, payment.year, payment.subject);
+    if (canonical && payment.subject !== canonical) {
+      payment.subject = canonical;
+      changed = true;
+    }
+  }
+  for (const order of data.paymentOrders || []) {
+    const note = (data.notes || []).find(item => item.id === order.noteId);
+    if (note && order.subject !== note.subject) {
+      order.subject = note.subject;
+      changed = true;
+    }
+  }
+  if (changed) writeData(data);
+}
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') };
 }
@@ -324,6 +378,7 @@ async function renderPdfPage(note, pageNumber, previewOnly = false) {
 
 async function api(req, res) {
   const data = readData();
+  hydrateCurriculumSubjects(data);
   hydrateLegacyPayments(data);
   const url = new URL(req.url, `http://${req.headers.host}`);
   const user = currentUser(req, data);
@@ -438,12 +493,14 @@ async function api(req, res) {
     const { course, year, subject, title, price, fileName, mimeType, fileData } = await readJson(req);
     if (![course, year, subject, title, fileName, fileData].every(value => typeof value === 'string' && value.trim())) return send(res, 400, { error: 'Complete all note details and choose a file.' });
     if (!['MBBS', 'BDS'].includes(course) || !/^Year [1-4]$/.test(year) || !Number.isFinite(Number(price)) || Number(price) < 0) return send(res, 400, { error: 'Enter valid course, year and price information.' });
+    const subjectName = canonicalSubject(course, year, subject);
+    if (!subjectName) return send(res, 400, { error: 'Choose a valid subject from the selected course and year.' });
     if (!['application/pdf', 'image/jpeg', 'image/png'].includes(mimeType)) return send(res, 400, { error: 'Upload a PDF, JPG or PNG file.' });
     const bytes = Buffer.from(fileData, 'base64'); if (!bytes.length || bytes.length > 15_000_000) return send(res, 400, { error: 'The note file must be under 15 MB.' });
     fs.mkdirSync(UPLOADS_DIR, { recursive: true }); const id = crypto.randomUUID(); const extension = mimeType === 'application/pdf' ? '.pdf' : mimeType === 'image/png' ? '.png' : '.jpg';
     const storedFile = path.join(UPLOADS_DIR, `${id}${extension}`);
     fs.writeFileSync(storedFile, bytes);
-    const note = { id, course, year, subject, title, price: Number(price), fileName, mimeType, extension, pageCount: mimeType === 'application/pdf' ? null : 1, uploadedBy: user.id, uploadedAt: new Date().toISOString() };
+    const note = { id, course, year, subject: subjectName, title, price: Number(price), fileName, mimeType, extension, pageCount: mimeType === 'application/pdf' ? null : 1, uploadedBy: user.id, uploadedAt: new Date().toISOString() };
     if (mimeType === 'application/pdf') note.pageCount = readPdfPageCount(note);
     data.notes.unshift(note); writeData(data);
     return send(res, 201, { note: publicNote(note) });
