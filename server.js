@@ -346,6 +346,18 @@ function hydrateNoteMetadata(data) {
 function renderedPagePath(note, pageNumber) {
   return path.join(RENDERS_DIR, `${note.id}-page-${pageNumber}.png`);
 }
+function resolveRenderedPagePath(note, pageNumber) {
+  const directPath = renderedPagePath(note, pageNumber);
+  if (fs.existsSync(directPath)) return directPath;
+  if (!fs.existsSync(RENDERS_DIR)) return null;
+  const prefix = `${note.id}-page-`;
+  const matched = fs.readdirSync(RENDERS_DIR).find(fileName => {
+    if (!fileName.startsWith(prefix) || !fileName.endsWith('.png')) return false;
+    const renderedNumber = Number(fileName.slice(prefix.length, -4));
+    return Number.isInteger(renderedNumber) && renderedNumber === pageNumber;
+  });
+  return matched ? path.join(RENDERS_DIR, matched) : null;
+}
 function previewRenderWindow(note) {
   return { start: 1, end: Math.min(Number(note.pageCount || 1), 5) };
 }
@@ -356,15 +368,17 @@ function standardRenderWindow(note, pageNumber) {
 }
 async function renderPdfRange(note, startPage, endPage) {
   fs.mkdirSync(RENDERS_DIR, { recursive: true });
-  const existingPages = [];
-  for (let page = startPage; page <= endPage; page += 1) existingPages.push(renderedPagePath(note, page));
-  if (existingPages.every(file => fs.existsSync(file))) return existingPages;
+  const expectedPages = [];
+  for (let page = startPage; page <= endPage; page += 1) expectedPages.push(page);
+  const resolvedBeforeRender = expectedPages.map(page => resolveRenderedPagePath(note, page));
+  if (resolvedBeforeRender.every(Boolean)) return resolvedBeforeRender;
   const jobKey = `${note.id}:${startPage}-${endPage}`;
   if (!pdfRenderJobs.has(jobKey)) {
     pdfRenderJobs.set(jobKey, Promise.resolve().then(() => {
-      if (existingPages.every(file => fs.existsSync(file))) return existingPages;
+      const resolvedExisting = expectedPages.map(page => resolveRenderedPagePath(note, page));
+      if (resolvedExisting.every(Boolean)) return resolvedExisting;
       execFileSync(PDFTOPPM_BIN, ['-f', String(startPage), '-l', String(endPage), '-png', '-r', '144', noteFilePath(note), path.join(RENDERS_DIR, `${note.id}-page`)], { windowsHide: true });
-      return existingPages;
+      return expectedPages.map(page => resolveRenderedPagePath(note, page));
     }).finally(() => pdfRenderJobs.delete(jobKey)));
   }
   return pdfRenderJobs.get(jobKey);
@@ -372,8 +386,7 @@ async function renderPdfRange(note, startPage, endPage) {
 async function renderPdfPage(note, pageNumber, previewOnly = false) {
   const window = previewOnly ? previewRenderWindow(note) : standardRenderWindow(note, pageNumber);
   await renderPdfRange(note, window.start, window.end);
-  const pageFile = renderedPagePath(note, pageNumber);
-  return fs.existsSync(pageFile) ? pageFile : null;
+  return resolveRenderedPagePath(note, pageNumber);
 }
 
 async function api(req, res) {

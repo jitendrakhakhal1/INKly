@@ -1048,7 +1048,12 @@ async function renderFile(container, note, maxPages) {
     img.loading = pageNumber === 1 ? 'eager' : 'lazy';
     img.decoding = 'async';
     if (pageNumber === 1) img.fetchPriority = 'high';
-    img.src = pageImageUrl(note.id, pageNumber, previewOnly);
+    let attempts = 0;
+    const maxAttempts = 3;
+    const setImageSource = () => {
+      const separator = previewOnly ? '&' : '?';
+      img.src = `${pageImageUrl(note.id, pageNumber, previewOnly)}${separator}attempt=${attempts}&t=${Date.now()}`;
+    };
     img.alt = `${note.title} page ${pageNumber}`;
     img.addEventListener('load', () => {
       loaded += 1;
@@ -1057,12 +1062,18 @@ async function renderFile(container, note, maxPages) {
       updateProgress();
     }, { once: true });
     img.addEventListener('error', () => {
+      if (attempts < maxAttempts - 1) {
+        attempts += 1;
+        setTimeout(setImageSource, 600 * attempts);
+        return;
+      }
       loaded += 1;
       container.querySelector(`.page-placeholder[data-page="${pageNumber}"]`)?.remove();
       img.classList.add('is-loaded');
       img.alt = `${note.title} page ${pageNumber} failed to load`;
       updateProgress();
-    }, { once: true });
+    });
+    setImageSource();
     container.append(img);
   };
 
