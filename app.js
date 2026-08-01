@@ -12,7 +12,9 @@ let state = {
   library: [],
   isAdmin: false,
   menu: '',
-  notes: []
+  notes: [],
+  adminNotes: [],
+  adminDashboard: null
 };
 
 const courses = [
@@ -242,7 +244,7 @@ async function signOut() {
   try {
     await request('/api/logout', { method: 'POST' });
   } catch (_) {}
-  state = { screen: 'auth', authMode: 'login', course: '', year: '', subject: '', selectedNoteId: '', user: '', email: '', library: [], isAdmin: false, menu: '', notes: [] };
+  state = { screen: 'auth', authMode: 'login', course: '', year: '', subject: '', selectedNoteId: '', user: '', email: '', library: [], isAdmin: false, menu: '', notes: [], adminNotes: [], adminDashboard: null };
   render();
 }
 
@@ -719,6 +721,13 @@ function developer() {
     <div class="eyebrow">Developer portal</div>
     <h1 class="heading">Upload a note set.</h1>
     <p class="sub">Add handwritten PDF, JPG or PNG notes for students to purchase.</p>
+    <div class="developer-toolbar">
+      <div class="developer-toolbar-copy">
+        <b>Manage your marketplace</b>
+        <span>Refresh live metrics, filter uploaded notes, and preview any subject listing from one place.</span>
+      </div>
+      <button class="next developer-refresh" onclick="refreshDeveloperPortal()">Refresh dashboard</button>
+    </div>
     <section class="developer-dashboard">
       <div id="developer-metrics" class="developer-metrics">Loading dashboard...</div>
       <div class="developer-panels">
@@ -749,7 +758,27 @@ function developer() {
       <button class="primary">Upload notes -></button>
     </form>
     <section class="uploaded-section">
-      <h2>Uploaded notes</h2>
+      <div class="uploaded-section-head">
+        <div>
+          <h2>Uploaded notes</h2>
+          <p>Filter by course, year, or search by title and subject.</p>
+        </div>
+        <div class="developer-filters">
+          <input class="input" id="developer-note-search" placeholder="Search notes..." oninput="renderUploadedNotesList()">
+          <select class="input" id="developer-course-filter" onchange="renderUploadedNotesList()">
+            <option value="">All courses</option>
+            <option value="MBBS">MBBS</option>
+            <option value="BDS">BDS</option>
+          </select>
+          <select class="input" id="developer-year-filter" onchange="renderUploadedNotesList()">
+            <option value="">All years</option>
+            <option value="Year 1">Year 1</option>
+            <option value="Year 2">Year 2</option>
+            <option value="Year 3">Year 3</option>
+            <option value="Year 4">Year 4</option>
+          </select>
+        </div>
+      </div>
       <div id="uploaded-notes" class="uploaded-notes">Loading your notes...</div>
     </section>
   </section></div>`;
@@ -759,11 +788,22 @@ async function loadDeveloperPortal() {
   await Promise.all([loadUploadedNotes(), loadDeveloperDashboard()]);
 }
 
+async function refreshDeveloperPortal() {
+  await loadNotes();
+  await loadDeveloperPortal();
+  toast('Developer dashboard refreshed.');
+}
+
 async function uploadNote(event) {
   event.preventDefault();
+  const submitButton = event.target.querySelector('button.primary');
   const file = document.querySelector('#upload-file').files[0];
   if (!file) return toast('Choose a note file to upload.');
   if (file.size > 15_000_000) return toast('Choose a file smaller than 15 MB.');
+  if (submitButton) {
+    submitButton.disabled = true;
+    submitButton.textContent = 'Uploading...';
+  }
   const base64 = await new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result.split(',')[1]);
@@ -790,6 +830,11 @@ async function uploadNote(event) {
     await loadDeveloperPortal();
   } catch (error) {
     toast(error.message);
+  } finally {
+    if (submitButton) {
+      submitButton.disabled = false;
+      submitButton.textContent = 'Upload notes ->';
+    }
   }
 }
 
@@ -797,12 +842,8 @@ async function loadUploadedNotes() {
   try {
     const { notes } = await request('/api/admin/notes');
     state.notes = notes || state.notes;
-    const el = document.querySelector('#uploaded-notes');
-    if (!el) return;
-    el.innerHTML = notes.length ? notes.map(n => `<article class="uploaded-note">
-      <div><b>${escapeHtml(n.title)}</b><span>${escapeHtml(n.course)} - ${escapeHtml(n.year)} - ${escapeHtml(n.subject)}</span><small>${escapeHtml(n.fileName)} - ${money(n.price)}</small></div>
-      <button onclick="selectNote('${n.id}')">Preview</button>
-    </article>`).join('') : 'No notes uploaded yet.';
+    state.adminNotes = notes || [];
+    renderUploadedNotesList();
   } catch (error) {
     const el = document.querySelector('#uploaded-notes');
     if (el) el.textContent = error.message;
@@ -812,6 +853,7 @@ async function loadUploadedNotes() {
 async function loadDeveloperDashboard() {
   try {
     const { metrics, activeUsers, payments } = await request('/api/admin/dashboard');
+    state.adminDashboard = { metrics, activeUsers, payments };
     const metricsEl = document.querySelector('#developer-metrics');
     if (metricsEl) {
       metricsEl.innerHTML = [
@@ -826,13 +868,30 @@ async function loadDeveloperDashboard() {
     const usersEl = document.querySelector('#active-users');
     if (usersEl) {
       usersEl.innerHTML = activeUsers.length
-        ? activeUsers.map(item => `<div class="developer-row"><div><b>${escapeHtml(item.name)}</b><span>${escapeHtml(item.email)}</span></div><small>${item.libraryCount} note${item.libraryCount === 1 ? '' : 's'}</small></div>`).join('')
+        ? activeUsers.map(item => `<div class="developer-row">
+            <div>
+              <b>${escapeHtml(item.name)}</b>
+              <span>${escapeHtml(item.email)}</span>
+              <small class="developer-chip">${item.libraryCount} note${item.libraryCount === 1 ? '' : 's'} in library</small>
+            </div>
+            <strong class="developer-mini-stat">Active</strong>
+          </div>`).join('')
         : '<p class="developer-empty">No active users right now.</p>';
     }
     const paymentsEl = document.querySelector('#payment-history');
     if (paymentsEl) {
       paymentsEl.innerHTML = payments.length
-        ? payments.map(payment => `<div class="developer-row"><div><b>${escapeHtml(payment.noteTitle)}</b><span>${escapeHtml(payment.buyerName)} - ${escapeHtml(payment.buyerEmail)}</span><small>${escapeHtml(payment.course)} - ${escapeHtml(payment.year)} - ${escapeHtml(payment.subject)}</small></div><strong>${money(payment.amount)}</strong></div>`).join('')
+        ? payments.map(payment => `<div class="developer-row">
+            <div>
+              <b>${escapeHtml(payment.noteTitle)}</b>
+              <span>${escapeHtml(payment.buyerName)} - ${escapeHtml(payment.buyerEmail)}</span>
+              <small>${escapeHtml(payment.course)} - ${escapeHtml(payment.year)} - ${escapeHtml(payment.subject)}</small>
+            </div>
+            <div class="developer-payment-side">
+              <strong>${money(payment.amount)}</strong>
+              <small class="developer-chip">${escapeHtml(payment.provider)}</small>
+            </div>
+          </div>`).join('')
         : '<p class="developer-empty">No payments recorded yet.</p>';
     }
   } catch (error) {
@@ -847,6 +906,43 @@ async function loadDeveloperDashboard() {
 
 function dashboardMetric(label, value) {
   return `<article class="metric-card"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></article>`;
+}
+
+function renderUploadedNotesList() {
+  const el = document.querySelector('#uploaded-notes');
+  if (!el) return;
+  const search = (document.querySelector('#developer-note-search')?.value || '').trim().toLowerCase();
+  const course = document.querySelector('#developer-course-filter')?.value || '';
+  const year = document.querySelector('#developer-year-filter')?.value || '';
+  const notes = (state.adminNotes || []).filter(note => {
+    const matchesSearch = !search || [note.title, note.subject, note.fileName].some(value => String(value || '').toLowerCase().includes(search));
+    const matchesCourse = !course || note.course === course;
+    const matchesYear = !year || note.year === year;
+    return matchesSearch && matchesCourse && matchesYear;
+  });
+  el.innerHTML = notes.length
+    ? notes.map(note => `<article class="uploaded-note uploaded-note-rich">
+        <div class="uploaded-note-main">
+          <div class="uploaded-note-title">
+            <b>${escapeHtml(note.title)}</b>
+            <span class="developer-chip">${money(note.price)}</span>
+          </div>
+          <span>${escapeHtml(note.course)} - ${escapeHtml(note.year)} - ${escapeHtml(note.subject)}</span>
+          <small>${escapeHtml(note.fileName)} - ${note.pageCount || 1} page${Number(note.pageCount || 1) === 1 ? '' : 's'}</small>
+        </div>
+        <div class="uploaded-note-actions">
+          <small>${formatShortDate(note.uploadedAt)}</small>
+          <button onclick="selectNote('${note.id}')">Preview</button>
+        </div>
+      </article>`).join('')
+    : '<p class="developer-empty">No uploaded notes match these filters yet.</p>';
+}
+
+function formatShortDate(value) {
+  if (!value) return 'Recently added';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Recently added';
+  return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
 function reader() {
