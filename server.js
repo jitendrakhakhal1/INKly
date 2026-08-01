@@ -23,6 +23,7 @@ const razorpayConfig = readRazorpayConfig();
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || razorpayConfig.keyId || '';
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || razorpayConfig.keySecret || '';
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const pdfRenderJobs = new Map();
 
 function ensureDir(dir) {
@@ -101,6 +102,44 @@ function publicPaymentConfig() {
     enabled: Boolean(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET)
   };
 }
+function ensureUserSessionVersion(user) {
+  if (!user) return 0;
+  if (!Number.isInteger(user.sessionVersion) || user.sessionVersion < 0) user.sessionVersion = 0;
+  return user.sessionVersion;
+}
+function sessionPayload(user, expiresAt) {
+  return `${user.id}.${expiresAt}.${ensureUserSessionVersion(user)}`;
+}
+function sessionSignature(payload, user) {
+  return crypto.createHmac('sha256', `${user.passwordHash}:${user.salt}`).update(payload).digest('hex');
+}
+function createSignedSessionToken(user, expiresAt = Date.now() + SESSION_TTL_MS) {
+  const payload = sessionPayload(user, expiresAt);
+  return `${payload}.${sessionSignature(payload, user)}`;
+}
+function parseSignedSessionToken(token) {
+  const [userId, expiresAtRaw, sessionVersionRaw, signature] = String(token || '').trim().split('.');
+  const expiresAt = Number(expiresAtRaw);
+  const sessionVersion = Number(sessionVersionRaw);
+  if (!userId || !Number.isFinite(expiresAt) || !Number.isInteger(sessionVersion) || !/^[a-f0-9]{64}$/i.test(signature || '')) return null;
+  return { userId, expiresAt, sessionVersion, signature };
+}
+function resolveSignedSession(token, data) {
+  const parsed = parseSignedSessionToken(token);
+  if (!parsed || parsed.expiresAt < Date.now()) return null;
+  const user = data.users.find(item => item.id === parsed.userId);
+  if (!user) return null;
+  if (ensureUserSessionVersion(user) !== parsed.sessionVersion) return null;
+  const payload = `${parsed.userId}.${parsed.expiresAt}.${parsed.sessionVersion}`;
+  const expected = sessionSignature(payload, user);
+  if (expected.length !== parsed.signature.length || !crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(parsed.signature, 'hex'))) return null;
+  return { user, expiresAt: parsed.expiresAt };
+}
+function clearUserSessions(data, userId) {
+  for (const [token, session] of Object.entries(data.sessions || {})) {
+    if (session?.userId === userId) delete data.sessions[token];
+  }
+}
 function syncAdminAccess(user, data) {
   if (!user || !ADMIN_EMAIL) return false;
   if (user.email === ADMIN_EMAIL && !user.isAdmin) {
@@ -116,6 +155,11 @@ function computeAdminFlag(email, data) {
 }
 function currentUser(req, data) {
   const token = parseCookies(req).inkly_session;
+  const signedSession = token && resolveSignedSession(token, data);
+  if (signedSession?.user) {
+    syncAdminAccess(signedSession.user, data);
+    return signedSession.user;
+  }
   const session = token && data.sessions[token];
   if (!session || session.expiresAt < Date.now()) return null;
   const user = data.users.find(item => item.id === session.userId) || null;
@@ -124,9 +168,10 @@ function currentUser(req, data) {
 }
 function sessionCookie(token) { return `inkly_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${IS_PRODUCTION ? '; Secure' : ''}`; }
 function clearCookie() { return `inkly_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${IS_PRODUCTION ? '; Secure' : ''}`; }
-function createSession(data, userId) {
-  const token = crypto.randomBytes(32).toString('hex');
-  data.sessions[token] = { userId, expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 };
+function createSession(data, user) {
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  const token = createSignedSessionToken(user, expiresAt);
+  data.sessions[token] = { userId: user.id, expiresAt };
   return token;
 }
 function readJson(req) {
@@ -271,15 +316,15 @@ async function api(req, res) {
     const { name, email, password } = await readJson(req); const normalized = String(email || '').trim().toLowerCase();
     if (!String(name || '').trim() || !validEmail(normalized) || !validPassword(password)) return send(res, 400, { error: 'Enter a name, valid email and a strong password.' });
     if (data.users.some(item => item.email === normalized)) return send(res, 409, { error: 'An account already exists with this email.' });
-    const secure = hashPassword(password); const newUser = { id: crypto.randomUUID(), name: String(name).trim(), email: normalized, passwordHash: secure.hash, salt: secure.salt, library: [], isAdmin: computeAdminFlag(normalized, data) };
-    data.users.push(newUser); const token = createSession(data, newUser.id); writeData(data);
+    const secure = hashPassword(password); const newUser = { id: crypto.randomUUID(), name: String(name).trim(), email: normalized, passwordHash: secure.hash, salt: secure.salt, library: [], isAdmin: computeAdminFlag(normalized, data), sessionVersion: 0 };
+    data.users.push(newUser); const token = createSession(data, newUser); writeData(data);
     return send(res, 201, { user: publicUser(newUser) }, { 'Set-Cookie': sessionCookie(token) });
   }
   if (req.method === 'POST' && url.pathname === '/api/login') {
     const { email, password } = await readJson(req); const found = data.users.find(item => item.email === String(email || '').trim().toLowerCase());
     if (!found || !passwordIsValid(String(password || ''), found)) return send(res, 401, { error: 'Incorrect email or password.' });
     syncAdminAccess(found, data);
-    const token = createSession(data, found.id); writeData(data); return send(res, 200, { user: publicUser(found) }, { 'Set-Cookie': sessionCookie(token) });
+    const token = createSession(data, found); writeData(data); return send(res, 200, { user: publicUser(found) }, { 'Set-Cookie': sessionCookie(token) });
   }
   if (req.method === 'POST' && url.pathname === '/api/reset-password') {
     const { email, password } = await readJson(req);
@@ -287,12 +332,20 @@ async function api(req, res) {
     if (!found) return send(res, 404, { error: 'No account was found with this email.' });
     if (!validPassword(password)) return send(res, 400, { error: 'Use 8+ characters with uppercase, lowercase and a number.' });
     const secure = hashPassword(password); found.passwordHash = secure.hash; found.salt = secure.salt;
+    clearUserSessions(data, found.id);
     syncAdminAccess(found, data);
-    const token = createSession(data, found.id); writeData(data);
+    const token = createSession(data, found); writeData(data);
     return send(res, 200, { user: publicUser(found) }, { 'Set-Cookie': sessionCookie(token) });
   }
   if (req.method === 'POST' && url.pathname === '/api/logout') {
-    const token = parseCookies(req).inkly_session; if (token) delete data.sessions[token]; writeData(data);
+    const token = parseCookies(req).inkly_session;
+    const signedSession = token && resolveSignedSession(token, data);
+    const legacySession = token && data.sessions[token];
+    const userId = signedSession?.user?.id || legacySession?.userId || '';
+    if (signedSession?.user) signedSession.user.sessionVersion = ensureUserSessionVersion(signedSession.user) + 1;
+    if (token) delete data.sessions[token];
+    if (userId) clearUserSessions(data, userId);
+    writeData(data);
     return send(res, 200, { ok: true }, { 'Set-Cookie': clearCookie() });
   }
   if (!user) return send(res, 401, { error: 'Please log in to continue.' });
