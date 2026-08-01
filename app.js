@@ -991,7 +991,7 @@ function renderUploadedNotesList() {
         </div>
         <div class="uploaded-note-actions">
           <small>${formatShortDate(note.uploadedAt)}</small>
-          <button onclick="selectNote('${note.id}')">Preview</button>
+          <button onclick="selectNote('${note.id}')">Open full notes</button>
         </div>
       </article>`).join('')
     : '<p class="developer-empty">No uploaded notes match these filters yet.</p>';
@@ -1057,6 +1057,7 @@ async function renderFile(container, note, maxPages) {
   container.innerHTML = '';
   let rendered = 0;
   let loaded = 0;
+  let sentinel = null;
 
   const progress = document.createElement('div');
   progress.className = 'loading-note loading-progress';
@@ -1122,13 +1123,14 @@ async function renderFile(container, note, maxPages) {
     const nextEnd = Math.min(count, rendered + batchSize);
     for (let pageNumber = rendered + 1; pageNumber <= nextEnd; pageNumber += 1) appendPage(pageNumber);
     rendered = nextEnd;
+    if (sentinel) container.append(sentinel);
   };
 
   renderNextBatch();
   updateProgress();
 
   if (!previewOnly && rendered < count) {
-    const sentinel = document.createElement('div');
+    sentinel = document.createElement('div');
     sentinel.className = 'page-sentinel';
     container.append(sentinel);
     const observer = new IntersectionObserver(entries => {
