@@ -262,6 +262,22 @@ function readPdfPageCount(note) {
     return null;
   }
 }
+function pipeFile(res, file, headers, options = {}) {
+  const missingStatus = options.missingStatus ?? 404;
+  const missingError = options.missingError || 'File not found.';
+  if (!fs.existsSync(file)) return send(res, missingStatus, { error: missingError });
+  res.writeHead(200, headers);
+  const stream = fs.createReadStream(file);
+  stream.on('error', error => {
+    console.error(`File stream error for ${file}:`, error);
+    if (!res.writableEnded) {
+      if (!res.headersSent) send(res, 500, { error: 'Unable to open the requested file right now.' });
+      else res.end();
+    }
+  });
+  stream.pipe(res);
+  return stream;
+}
 function hydrateNoteMetadata(data) {
   let changed = false;
   for (const note of data.notes) {
@@ -302,7 +318,8 @@ async function renderPdfRange(note, startPage, endPage) {
 async function renderPdfPage(note, pageNumber, previewOnly = false) {
   const window = previewOnly ? previewRenderWindow(note) : standardRenderWindow(note, pageNumber);
   await renderPdfRange(note, window.start, window.end);
-  return renderedPagePath(note, pageNumber);
+  const pageFile = renderedPagePath(note, pageNumber);
+  return fs.existsSync(pageFile) ? pageFile : null;
 }
 
 async function api(req, res) {
@@ -363,13 +380,12 @@ async function api(req, res) {
     if (!previewOnly && !ownsNote(user, note)) return send(res, 403, { error: 'Purchase these notes before opening the full file.' });
     const file = noteFilePath(note);
     if (!fs.existsSync(file)) return send(res, 404, { error: 'Uploaded file is missing.' });
-    res.writeHead(200, {
+    return pipeFile(res, file, {
       'Content-Type': note.mimeType,
       'Content-Disposition': `inline; filename="${safeFileName(note.fileName)}"`,
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff'
-    });
-    return fs.createReadStream(file).pipe(res);
+    }, { missingError: 'Uploaded file is missing.' });
   }
   if (req.method === 'GET' && pageMatch) {
     const note = data.notes.find(item => item.id === decodeURIComponent(pageMatch[1]));
@@ -383,8 +399,8 @@ async function api(req, res) {
     if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > pageCount) return send(res, 404, { error: 'Page not found.' });
     if (previewOnly && !ownsNote(user, note) && pageNumber > 5) return send(res, 403, { error: 'Only the first 5 preview pages are available before purchase.' });
     const renderedPage = await renderPdfPage(note, pageNumber, previewOnly);
-    res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
-    return fs.createReadStream(renderedPage).pipe(res);
+    if (!renderedPage) return send(res, 503, { error: 'This preview page is still being prepared. Please try again in a moment.' });
+    return pipeFile(res, renderedPage, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }, { missingStatus: 503, missingError: 'This preview page is still being prepared. Please try again in a moment.' });
   }
   if (req.method === 'GET' && url.pathname === '/api/admin/notes') {
     if (!user.isAdmin) return send(res, 403, { error: 'Developer access is required.' });
@@ -552,7 +568,7 @@ const server = http.createServer(async (req, res) => {
     if (requested.startsWith('/uploads/')) return res.writeHead(404).end('Not found');
     const file = path.resolve(ROOT, `.${requested}`);
     if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return res.writeHead(404).end('Not found');
-    res.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' }); fs.createReadStream(file).pipe(res);
+    return pipeFile(res, file, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' }, { missingError: 'Static file not found.' });
   } catch (error) { send(res, 500, { error: error.message || 'Server error.' }); }
 });
 server.listen(PORT, () => console.log(`Inkly server listening on port ${PORT} (${NODE_ENV})`));
