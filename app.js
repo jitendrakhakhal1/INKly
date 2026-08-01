@@ -1041,7 +1041,108 @@ async function renderNotePreview(note) {
 async function renderSecureNote(note) {
   const container = document.querySelector('#reader-pages');
   if (!container) return;
-  await renderFile(container, note, Infinity);
+  await renderPagedReader(container, note);
+}
+
+function pageUrlWithAttempt(note, pageNumber, previewOnly, attempt) {
+  const baseUrl = pageImageUrl(note.id, pageNumber, previewOnly);
+  if (!attempt) return baseUrl;
+  const separator = baseUrl.includes('?') ? '&' : '?';
+  return `${baseUrl}${separator}attempt=${attempt}&t=${Date.now()}`;
+}
+
+async function renderPagedReader(container, note) {
+  container.innerHTML = '<div class="loading-note">Opening notes...</div>';
+  if (note.mimeType !== 'application/pdf') {
+    container.innerHTML = `<img class="secure-image is-loaded" src="${fileUrl(note.id)}" alt="${escapeHtml(note.title)}">`;
+    return;
+  }
+
+  const totalPages = Math.max(1, Number(note.pageCount || 1));
+  let currentPage = 1;
+  const token = `${note.id}-${Date.now()}`;
+  container.dataset.viewerToken = token;
+  container.innerHTML = `
+    <div class="reader-pager">
+      <button id="reader-prev-page" type="button" aria-label="Previous page">Prev</button>
+      <label class="reader-page-field">
+        <span>Page</span>
+        <input id="reader-page-input" type="number" min="1" max="${totalPages}" value="1">
+        <small>of ${totalPages}</small>
+      </label>
+      <button id="reader-next-page" type="button" aria-label="Next page">Next</button>
+    </div>
+    <div id="reader-page-stage" class="reader-page-stage"></div>
+  `;
+
+  const stage = container.querySelector('#reader-page-stage');
+  const input = container.querySelector('#reader-page-input');
+  const previousButton = container.querySelector('#reader-prev-page');
+  const nextButton = container.querySelector('#reader-next-page');
+
+  const preloadPage = pageNumber => {
+    if (pageNumber < 1 || pageNumber > totalPages) return;
+    const image = new Image();
+    image.decoding = 'async';
+    image.src = pageUrlWithAttempt(note, pageNumber, false, 0);
+  };
+
+  const updateControls = () => {
+    input.value = String(currentPage);
+    previousButton.disabled = currentPage <= 1;
+    nextButton.disabled = currentPage >= totalPages;
+  };
+
+  const showPage = pageNumber => {
+    currentPage = Math.min(totalPages, Math.max(1, Number(pageNumber) || 1));
+    const requestedPage = currentPage;
+    updateControls();
+    stage.innerHTML = `<div class="page-placeholder reader-page-placeholder"><span>Page ${requestedPage}</span></div>`;
+    let attempts = 0;
+    const maxAttempts = 3;
+    const image = document.createElement('img');
+    image.className = 'pdf-page-image reader-single-page';
+    image.decoding = 'async';
+    image.loading = 'eager';
+    image.fetchPriority = 'high';
+    image.alt = `${note.title} page ${requestedPage}`;
+    image.addEventListener('load', () => {
+      if (container.dataset.viewerToken !== token || currentPage !== requestedPage) return;
+      stage.innerHTML = '';
+      image.classList.add('is-loaded');
+      stage.append(image);
+      preloadPage(requestedPage + 1);
+      preloadPage(requestedPage + 2);
+      preloadPage(requestedPage - 1);
+    }, { once: true });
+    image.addEventListener('error', () => {
+      if (currentPage !== requestedPage) return;
+      if (attempts < maxAttempts - 1) {
+        attempts += 1;
+        setTimeout(() => {
+          if (currentPage === requestedPage) image.src = pageUrlWithAttempt(note, requestedPage, false, attempts);
+        }, 600 * attempts);
+        return;
+      }
+      if (container.dataset.viewerToken !== token || currentPage !== requestedPage) return;
+      stage.innerHTML = `<div class="loading-note">This page is still being prepared. Try the next page or retry in a moment.</div>`;
+    });
+    image.src = pageUrlWithAttempt(note, requestedPage, false, attempts);
+  };
+
+  previousButton.addEventListener('click', () => showPage(currentPage - 1));
+  nextButton.addEventListener('click', () => showPage(currentPage + 1));
+  input.addEventListener('change', () => showPage(input.value));
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter') showPage(input.value);
+  });
+  container.tabIndex = 0;
+  container.addEventListener('keydown', event => {
+    if (event.key === 'ArrowLeft') showPage(currentPage - 1);
+    if (event.key === 'ArrowRight') showPage(currentPage + 1);
+  });
+
+  showPage(1);
 }
 
 async function renderFile(container, note, maxPages) {
@@ -1093,8 +1194,7 @@ async function renderFile(container, note, maxPages) {
     let attempts = 0;
     const maxAttempts = 3;
     const setImageSource = () => {
-      const separator = previewOnly ? '&' : '?';
-      img.src = `${pageImageUrl(note.id, pageNumber, previewOnly)}${separator}attempt=${attempts}&t=${Date.now()}`;
+      img.src = pageUrlWithAttempt(note, pageNumber, previewOnly, attempts);
     };
     img.alt = `${note.title} page ${pageNumber}`;
     img.addEventListener('load', () => {

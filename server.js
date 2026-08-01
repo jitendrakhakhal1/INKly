@@ -376,9 +376,8 @@ function warmNotePages(note) {
 }
 function warmNextPageWindow(note, pageNumber, previewOnly = false) {
   if (!note || note.mimeType !== 'application/pdf' || previewOnly) return;
-  const currentWindow = standardRenderWindow(note, pageNumber);
-  const nextStart = currentWindow.end + 1;
   const totalPages = Math.max(1, Number(note.pageCount || 1));
+  const nextStart = Number(pageNumber || 1) + 1;
   if (nextStart > totalPages) return;
   const nextEnd = Math.min(totalPages, nextStart + PDF_RENDER_BATCH_SIZE - 1);
   queueRenderRange(note, nextStart, nextEnd);
@@ -409,7 +408,7 @@ async function renderPdfRange(note, startPage, endPage) {
   return pdfRenderJobs.get(jobKey);
 }
 async function renderPdfPage(note, pageNumber, previewOnly = false) {
-  const window = previewOnly ? previewRenderWindow(note) : standardRenderWindow(note, pageNumber);
+  const window = previewOnly ? previewRenderWindow(note) : { start: pageNumber, end: pageNumber };
   await renderPdfRange(note, window.start, window.end);
   return resolveRenderedPagePath(note, pageNumber);
 }
@@ -495,7 +494,7 @@ async function api(req, res) {
     const renderedPage = await renderPdfPage(note, pageNumber, previewOnly);
     if (!renderedPage) return send(res, 503, { error: 'This preview page is still being prepared. Please try again in a moment.' });
     warmNextPageWindow(note, pageNumber, previewOnly);
-    return pipeFile(res, renderedPage, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }, { missingStatus: 503, missingError: 'This preview page is still being prepared. Please try again in a moment.' });
+    return pipeFile(res, renderedPage, { 'Content-Type': 'image/png', 'Cache-Control': 'private, max-age=3600', 'X-Content-Type-Options': 'nosniff' }, { missingStatus: 503, missingError: 'This preview page is still being prepared. Please try again in a moment.' });
   }
   if (req.method === 'GET' && url.pathname === '/api/admin/notes') {
     if (!user.isAdmin) return send(res, 403, { error: 'Developer access is required.' });
