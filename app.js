@@ -13,6 +13,8 @@ let state = {
   isAdmin: false,
   menu: '',
   notes: [],
+  notesLoading: false,
+  notesError: '',
   adminNotes: [],
   adminDashboard: null
 };
@@ -168,12 +170,33 @@ function setUser(user) {
 }
 
 async function loadNotes() {
-  try {
-    const result = await request('/api/notes');
-    state.notes = result.notes || [];
-  } catch (_) {
-    state.notes = [];
+  state.notesLoading = true;
+  state.notesError = '';
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const result = await request('/api/notes');
+      state.notes = result.notes || [];
+      state.notesLoading = false;
+      state.notesError = '';
+      return true;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 700 * (attempt + 1)));
+    }
   }
+  state.notes = [];
+  state.notesLoading = false;
+  state.notesError = lastError?.message || 'Uploaded notes could not be loaded right now.';
+  return false;
+}
+
+async function refreshNotesIfNeeded(force = false) {
+  if (state.notesLoading) return;
+  if (!force && state.notes.length && !state.notesError) return;
+  const ok = await loadNotes();
+  if (!ok && force) toast(state.notesError);
+  if (['select', 'preview', 'reader'].includes(state.screen)) render();
 }
 
 function nav() {
@@ -215,6 +238,7 @@ function go(screen) {
   state.screen = screen;
   state.menu = '';
   render();
+  if (screen === 'select') setTimeout(() => refreshNotesIfNeeded(), 0);
   window.scrollTo(0, 0);
 }
 
@@ -248,7 +272,7 @@ async function signOut() {
   try {
     await request('/api/logout', { method: 'POST' });
   } catch (_) {}
-  state = { screen: 'auth', authMode: 'login', course: '', year: '', subject: '', selectedNoteId: '', user: '', email: '', library: [], isAdmin: false, menu: '', notes: [], adminNotes: [], adminDashboard: null };
+  state = { screen: 'auth', authMode: 'login', course: '', year: '', subject: '', selectedNoteId: '', user: '', email: '', library: [], isAdmin: false, menu: '', notes: [], notesLoading: false, notesError: '', adminNotes: [], adminDashboard: null };
   render();
 }
 
@@ -298,6 +322,7 @@ async function submitAuth(e) {
       setUser(result.user);
     }
     await loadNotes();
+    if (state.notesError) toast(state.notesError);
     go('select');
   } catch (error) {
     toast(error.message);
@@ -353,6 +378,7 @@ async function resetPassword(e) {
     });
     setUser(result.user);
     await loadNotes();
+    if (state.notesError) toast(state.notesError);
     go('select');
     setTimeout(() => toast('Password updated - you are now signed in.'), 50);
   } catch (error) {
@@ -428,6 +454,19 @@ function select() {
 
 function noteCards(notes) {
   if (!state.subject) return '';
+  if (state.notesLoading) {
+    return `<div class="notes-list empty-notes">
+      <h3>Loading uploaded notes for ${escapeHtml(state.subject)}...</h3>
+      <p>We are checking the latest uploads for this subject.</p>
+    </div>`;
+  }
+  if (state.notesError) {
+    return `<div class="notes-list empty-notes">
+      <h3>We couldn't load uploaded notes just now.</h3>
+      <p>${escapeHtml(state.notesError)}</p>
+      <button class="next" onclick="refreshNotesIfNeeded(true)">Retry loading notes</button>
+    </div>`;
+  }
   if (!notes.length) {
     return `<div class="notes-list empty-notes">
       <h3>No uploaded notes for ${escapeHtml(state.subject)} yet.</h3>
@@ -456,6 +495,8 @@ function noteCards(notes) {
 
 function selectedContinueText(notes) {
   if (!state.subject) return 'Select a subject';
+  if (state.notesLoading) return 'Loading uploaded notes...';
+  if (state.notesError) return 'Retry loading uploaded notes';
   if (!notes.length) return 'No uploaded notes for this subject';
   return state.selectedNoteId ? 'Note selected' : 'Choose a note to preview';
 }
@@ -1133,6 +1174,7 @@ async function start() {
     if (result.user) {
       setUser(result.user);
       await loadNotes();
+      if (state.notesError) toast(state.notesError);
       state.screen = 'select';
     }
   } catch (_) {
