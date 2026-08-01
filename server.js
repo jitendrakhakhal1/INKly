@@ -15,6 +15,7 @@ const RAZORPAY_CONFIG_FILE = path.join(ROOT, 'razorpay-config.json');
 const MAX_BODY_SIZE = 20_000_000;
 const UPLOADS_DIR = path.join(STORAGE_DIR, 'uploads');
 const RENDERS_DIR = path.join(STORAGE_DIR, 'tmp', 'pdf-pages');
+const PDF_RENDER_BATCH_SIZE = 4;
 const POPPLER_BIN_DIR = path.join(process.env.USERPROFILE || '', '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'native', 'poppler', 'Library', 'bin');
 const PDFINFO_BIN = fs.existsSync(path.join(POPPLER_BIN_DIR, 'pdfinfo.exe')) ? path.join(POPPLER_BIN_DIR, 'pdfinfo.exe') : 'pdfinfo';
 const PDFTOPPM_BIN = fs.existsSync(path.join(POPPLER_BIN_DIR, 'pdftoppm.exe')) ? path.join(POPPLER_BIN_DIR, 'pdftoppm.exe') : 'pdftoppm';
@@ -22,6 +23,7 @@ const razorpayConfig = readRazorpayConfig();
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || razorpayConfig.keyId || '';
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || razorpayConfig.keySecret || '';
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+const pdfRenderJobs = new Map();
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -226,14 +228,36 @@ function hydrateNoteMetadata(data) {
   }
   if (changed) writeData(data);
 }
-function renderPdfPage(note, pageNumber) {
+function renderedPagePath(note, pageNumber) {
+  return path.join(RENDERS_DIR, `${note.id}-page-${pageNumber}.png`);
+}
+function previewRenderWindow(note) {
+  return { start: 1, end: Math.min(Number(note.pageCount || 1), 5) };
+}
+function standardRenderWindow(note, pageNumber) {
+  const totalPages = Math.max(1, Number(note.pageCount || 1));
+  const start = Math.floor((pageNumber - 1) / PDF_RENDER_BATCH_SIZE) * PDF_RENDER_BATCH_SIZE + 1;
+  return { start, end: Math.min(totalPages, start + PDF_RENDER_BATCH_SIZE - 1) };
+}
+async function renderPdfRange(note, startPage, endPage) {
   fs.mkdirSync(RENDERS_DIR, { recursive: true });
-  const prefix = path.join(RENDERS_DIR, `${note.id}-page-${pageNumber}`);
-  const pngFile = `${prefix}.png`;
-  if (!fs.existsSync(pngFile)) {
-    execFileSync(PDFTOPPM_BIN, ['-f', String(pageNumber), '-l', String(pageNumber), '-singlefile', '-png', '-r', '144', noteFilePath(note), prefix], { windowsHide: true });
+  const existingPages = [];
+  for (let page = startPage; page <= endPage; page += 1) existingPages.push(renderedPagePath(note, page));
+  if (existingPages.every(file => fs.existsSync(file))) return existingPages;
+  const jobKey = `${note.id}:${startPage}-${endPage}`;
+  if (!pdfRenderJobs.has(jobKey)) {
+    pdfRenderJobs.set(jobKey, Promise.resolve().then(() => {
+      if (existingPages.every(file => fs.existsSync(file))) return existingPages;
+      execFileSync(PDFTOPPM_BIN, ['-f', String(startPage), '-l', String(endPage), '-png', '-r', '144', noteFilePath(note), path.join(RENDERS_DIR, `${note.id}-page`)], { windowsHide: true });
+      return existingPages;
+    }).finally(() => pdfRenderJobs.delete(jobKey)));
   }
-  return pngFile;
+  return pdfRenderJobs.get(jobKey);
+}
+async function renderPdfPage(note, pageNumber, previewOnly = false) {
+  const window = previewOnly ? previewRenderWindow(note) : standardRenderWindow(note, pageNumber);
+  await renderPdfRange(note, window.start, window.end);
+  return renderedPagePath(note, pageNumber);
 }
 
 async function api(req, res) {
@@ -305,7 +329,7 @@ async function api(req, res) {
     const pageCount = note.pageCount || 1;
     if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > pageCount) return send(res, 404, { error: 'Page not found.' });
     if (previewOnly && !ownsNote(user, note) && pageNumber > 5) return send(res, 403, { error: 'Only the first 5 preview pages are available before purchase.' });
-    const renderedPage = renderPdfPage(note, pageNumber);
+    const renderedPage = await renderPdfPage(note, pageNumber, previewOnly);
     res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
     return fs.createReadStream(renderedPage).pipe(res);
   }

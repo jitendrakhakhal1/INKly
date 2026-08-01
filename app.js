@@ -248,7 +248,7 @@ async function signOut() {
 
 function auth() {
   const signup = state.authMode === 'signup';
-  return `<section class="auth">
+  return `<section class="auth screen-animate">
     <div class="auth-art">
       <div class="brand"><i class="brand-mark"></i>inkly</div>
       <div class="auth-words">
@@ -311,7 +311,7 @@ function togglePassword(id, button) {
 }
 
 function forgotPassword() {
-  return `<section class="auth">
+  return `<section class="auth screen-animate">
     <div class="auth-art">
       <div class="brand"><i class="brand-mark"></i>inkly</div>
       <div class="auth-words"><h1>Back to your<br><em>best</em> study self.</h1><p>Set a new password and get back to your notes.</p></div>
@@ -396,7 +396,7 @@ function select() {
   const subjectNotes = stage === 'subject' && state.subject ? notesForPath() : [];
   const canContinue = stage === 'subject' ? !!state.selectedNoteId : !!val;
 
-  return `<div class="shell">${nav()}<section class="content">
+  return `<div class="shell screen-animate">${nav()}<section class="content">
     <div class="eyebrow">Find your notes</div>
     <h1 class="heading">${title}</h1>
     <p class="sub">${description}</p>
@@ -511,7 +511,7 @@ function ownsNote(note) {
 function preview() {
   const note = selectedUploadedNote();
   if (!note) {
-    return `<div class="shell">${nav()}<section class="content">
+    return `<div class="shell screen-animate">${nav()}<section class="content">
       <h1 class="heading">No notes uploaded here yet.</h1>
       <p class="sub">Choose another subject or upload this note set from the Developer portal.</p>
       <button class="next" style="margin-top:25px" onclick="go('select')">Back to subjects</button>
@@ -521,7 +521,7 @@ function preview() {
   const owned = ownsNote(note);
   setTimeout(() => renderNotePreview(note), 0);
 
-  return `<div class="shell note-view-shell">${nav()}<section class="content">
+  return `<div class="shell note-view-shell screen-animate">${nav()}<section class="content">
     <div class="eyebrow">Notes preview</div>
     <div class="filters">
       <span class="pill">${escapeHtml(note.course)}</span>
@@ -549,7 +549,7 @@ function preview() {
 function payment() {
   const note = selectedUploadedNote();
   if (!note) return preview();
-  return `<div class="shell">${nav()}<section class="content">
+  return `<div class="shell screen-animate">${nav()}<section class="content">
     <div class="eyebrow">Secure checkout</div>
     <h1 class="heading">Almost yours.</h1>
     <p class="sub">Pay securely with Razorpay and unlock full in-app access to these notes.</p>
@@ -674,7 +674,7 @@ function toast(message) {
 
 function profile() {
   const noteCount = state.library.length;
-  return `<div class="shell">${nav()}<section class="content profile-page">
+  return `<div class="shell screen-animate">${nav()}<section class="content profile-page">
     <div class="eyebrow">Account</div>
     <h1 class="heading">Your profile.</h1>
     <p class="sub">Manage your study space and purchased notes.</p>
@@ -713,9 +713,9 @@ async function saveProfile() {
 }
 
 function developer() {
-  if (!state.isAdmin) return `<div class="shell">${nav()}<section class="content"><h1 class="heading">Developer access required.</h1></section></div>`;
+  if (!state.isAdmin) return `<div class="shell screen-animate">${nav()}<section class="content"><h1 class="heading">Developer access required.</h1></section></div>`;
   setTimeout(loadDeveloperPortal, 0);
-  return `<div class="shell">${nav()}<section class="content">
+  return `<div class="shell screen-animate">${nav()}<section class="content">
     <div class="eyebrow">Developer portal</div>
     <h1 class="heading">Upload a note set.</h1>
     <p class="sub">Add handwritten PDF, JPG or PNG notes for students to purchase.</p>
@@ -852,11 +852,11 @@ function dashboardMetric(label, value) {
 function reader() {
   const note = selectedUploadedNote();
   if (!note) {
-    return `<section class="reader"><header class="reader-nav"><div class="brand"><i class="brand-mark"></i>inkly</div><div class="reader-tools"><button onclick="go('select')"><- Back</button></div></header><div class="reader-body"><article class="reader-page"><h1>No note selected</h1><p>Please choose an uploaded note from the subjects page.</p></article></div></section>`;
+    return `<section class="reader screen-animate"><header class="reader-nav"><div class="brand"><i class="brand-mark"></i>inkly</div><div class="reader-tools"><button onclick="go('select')"><- Back</button></div></header><div class="reader-body"><article class="reader-page"><h1>No note selected</h1><p>Please choose an uploaded note from the subjects page.</p></article></div></section>`;
   }
   if (!ownsNote(note)) return preview();
   setTimeout(() => renderSecureNote(note), 0);
-  return `<section class="reader">
+  return `<section class="reader screen-animate">
     <header class="reader-nav">
       <div class="brand"><i class="brand-mark"></i>inkly</div>
       <div class="reader-tools">
@@ -892,16 +892,56 @@ async function renderSecureNote(note) {
 async function renderFile(container, note, maxPages) {
   container.innerHTML = '<div class="loading-note">Loading pages...</div>';
   if (note.mimeType !== 'application/pdf') {
-    container.innerHTML = `<img class="secure-image" src="${fileUrl(note.id, maxPages !== Infinity)}" alt="${escapeHtml(note.title)}">`;
+    container.innerHTML = `<img class="secure-image is-loaded" src="${fileUrl(note.id, maxPages !== Infinity)}" alt="${escapeHtml(note.title)}">`;
     return;
   }
   const totalPages = Math.max(1, Number(note.pageCount || 1));
   const count = Math.min(totalPages, maxPages);
-  container.innerHTML = Array.from({ length: count }, (_, index) => {
-    const pageNumber = index + 1;
-    return `<img class="pdf-page-image" loading="${pageNumber <= 2 ? 'eager' : 'lazy'}" src="${pageImageUrl(note.id, pageNumber, maxPages !== Infinity)}" alt="${escapeHtml(note.title)} page ${pageNumber}">`;
-  }).join('');
-  if (maxPages !== Infinity && totalPages > count) {
+  const previewOnly = maxPages !== Infinity;
+  const batchSize = previewOnly ? count : 4;
+  container.innerHTML = '';
+  let rendered = 0;
+
+  const appendPage = pageNumber => {
+    const img = document.createElement('img');
+    img.className = 'pdf-page-image';
+    img.loading = pageNumber === 1 ? 'eager' : 'lazy';
+    img.decoding = 'async';
+    if (pageNumber === 1) img.fetchPriority = 'high';
+    img.src = pageImageUrl(note.id, pageNumber, previewOnly);
+    img.alt = `${note.title} page ${pageNumber}`;
+    img.addEventListener('load', () => img.classList.add('is-loaded'), { once: true });
+    img.addEventListener('error', () => {
+      img.classList.add('is-loaded');
+      img.alt = `${note.title} page ${pageNumber} failed to load`;
+    }, { once: true });
+    container.append(img);
+  };
+
+  const renderNextBatch = () => {
+    const nextEnd = Math.min(count, rendered + batchSize);
+    for (let pageNumber = rendered + 1; pageNumber <= nextEnd; pageNumber += 1) appendPage(pageNumber);
+    rendered = nextEnd;
+  };
+
+  renderNextBatch();
+
+  if (!previewOnly && rendered < count) {
+    const sentinel = document.createElement('div');
+    sentinel.className = 'page-sentinel';
+    container.append(sentinel);
+    const observer = new IntersectionObserver(entries => {
+      if (!entries.some(entry => entry.isIntersecting)) return;
+      renderNextBatch();
+      if (rendered >= count) {
+        observer.disconnect();
+        sentinel.remove();
+      }
+    }, { root: container, rootMargin: '240px 0px' });
+    observer.observe(sentinel);
+  }
+
+  if (previewOnly && totalPages > count) {
     const locked = document.createElement('div');
     locked.className = 'locked-pages';
     locked.textContent = `${totalPages - count} more page${totalPages - count === 1 ? '' : 's'} available after purchase`;
