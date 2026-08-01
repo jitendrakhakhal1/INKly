@@ -29,6 +29,12 @@
 .pdf-page-image:hover{box-shadow:0 10px 28px #1a221214}
 .loading-note{position:relative;overflow:hidden;min-height:72px;display:grid;place-items:center}
 .loading-note:before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(114,84,232,.09),transparent);animation:shimmer 1.35s ease-in-out infinite}
+.loading-progress{position:sticky;top:0;z-index:1}
+.loading-progress.is-soft{border-style:solid;background:#faf8f2}
+.loading-progress.is-complete{opacity:0;transform:translateY(-6px);transition:opacity .28s ease,transform .28s ease}
+.page-placeholder{width:min(100%,900px);aspect-ratio:1 / 1.414;background:linear-gradient(180deg,#fbfaf7,#f1ede2);border:1px solid #ece4d2;border-radius:6px;position:relative;overflow:hidden;display:grid;place-items:end start;padding:14px;color:#8b8270;font-size:12px}
+.page-placeholder:before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(114,84,232,.08),transparent);animation:shimmer 1.2s ease-in-out infinite}
+.page-placeholder span{position:relative;z-index:1;background:rgba(255,255,255,.76);padding:4px 8px;border-radius:999px}
 .page-sentinel{width:100%;height:20px}
 .secure-image{opacity:0;transform:translateY(10px);transition:opacity .28s ease,transform .28s ease}
 .secure-image.is-loaded{opacity:1;transform:none}

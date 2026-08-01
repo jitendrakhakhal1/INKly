@@ -901,8 +901,34 @@ async function renderFile(container, note, maxPages) {
   const batchSize = previewOnly ? count : 4;
   container.innerHTML = '';
   let rendered = 0;
+  let loaded = 0;
+
+  const progress = document.createElement('div');
+  progress.className = 'loading-note loading-progress';
+  progress.textContent = `Loading pages 0 of ${count}...`;
+  container.append(progress);
+
+  const updateProgress = () => {
+    progress.textContent = loaded >= count
+      ? `Loaded ${count} page${count === 1 ? '' : 's'}`
+      : `Loading pages ${loaded} of ${count}...`;
+    if (loaded > 0) progress.classList.add('is-soft');
+    if (loaded >= Math.min(2, count)) {
+      progress.classList.add('is-complete');
+      setTimeout(() => progress.remove(), 350);
+    }
+  };
+
+  const appendPlaceholder = pageNumber => {
+    const placeholder = document.createElement('div');
+    placeholder.className = 'page-placeholder';
+    placeholder.dataset.page = String(pageNumber);
+    placeholder.innerHTML = `<span>Page ${pageNumber}</span>`;
+    container.append(placeholder);
+  };
 
   const appendPage = pageNumber => {
+    appendPlaceholder(pageNumber);
     const img = document.createElement('img');
     img.className = 'pdf-page-image';
     img.loading = pageNumber === 1 ? 'eager' : 'lazy';
@@ -910,10 +936,18 @@ async function renderFile(container, note, maxPages) {
     if (pageNumber === 1) img.fetchPriority = 'high';
     img.src = pageImageUrl(note.id, pageNumber, previewOnly);
     img.alt = `${note.title} page ${pageNumber}`;
-    img.addEventListener('load', () => img.classList.add('is-loaded'), { once: true });
+    img.addEventListener('load', () => {
+      loaded += 1;
+      container.querySelector(`.page-placeholder[data-page="${pageNumber}"]`)?.remove();
+      img.classList.add('is-loaded');
+      updateProgress();
+    }, { once: true });
     img.addEventListener('error', () => {
+      loaded += 1;
+      container.querySelector(`.page-placeholder[data-page="${pageNumber}"]`)?.remove();
       img.classList.add('is-loaded');
       img.alt = `${note.title} page ${pageNumber} failed to load`;
+      updateProgress();
     }, { once: true });
     container.append(img);
   };
@@ -925,6 +959,7 @@ async function renderFile(container, note, maxPages) {
   };
 
   renderNextBatch();
+  updateProgress();
 
   if (!previewOnly && rendered < count) {
     const sentinel = document.createElement('div');
