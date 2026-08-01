@@ -24,6 +24,8 @@ const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || razorpayConfig.keyId || '
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || razorpayConfig.keySecret || '';
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const NOTE_WARM_PAGE_COUNT = 8;
+const NOTE_WARM_LIMIT = 12;
 const COURSE_SUBJECTS = {
   MBBS: {
     'Year 1': ['Anatomy', 'Physiology', 'Biochemistry'],
@@ -358,6 +360,29 @@ function resolveRenderedPagePath(note, pageNumber) {
   });
   return matched ? path.join(RENDERS_DIR, matched) : null;
 }
+function queueRenderRange(note, startPage, endPage) {
+  if (!note || note.mimeType !== 'application/pdf' || !Number(note.pageCount)) return;
+  const totalPages = Math.max(1, Number(note.pageCount || 1));
+  const safeStart = Math.max(1, Number(startPage || 1));
+  const safeEnd = Math.min(totalPages, Math.max(safeStart, Number(endPage || safeStart)));
+  Promise.resolve()
+    .then(() => renderPdfRange(note, safeStart, safeEnd))
+    .catch(error => console.error(`Background PDF render failed for ${note.id} pages ${safeStart}-${safeEnd}:`, error));
+}
+function warmNotePages(note) {
+  if (!note || note.mimeType !== 'application/pdf') return;
+  const totalPages = Math.max(1, Number(note.pageCount || 1));
+  queueRenderRange(note, 1, Math.min(totalPages, NOTE_WARM_PAGE_COUNT));
+}
+function warmNextPageWindow(note, pageNumber, previewOnly = false) {
+  if (!note || note.mimeType !== 'application/pdf' || previewOnly) return;
+  const currentWindow = standardRenderWindow(note, pageNumber);
+  const nextStart = currentWindow.end + 1;
+  const totalPages = Math.max(1, Number(note.pageCount || 1));
+  if (nextStart > totalPages) return;
+  const nextEnd = Math.min(totalPages, nextStart + PDF_RENDER_BATCH_SIZE - 1);
+  queueRenderRange(note, nextStart, nextEnd);
+}
 function previewRenderWindow(note) {
   return { start: 1, end: Math.min(Number(note.pageCount || 1), 5) };
 }
@@ -437,6 +462,7 @@ async function api(req, res) {
   if (req.method === 'GET' && url.pathname === '/api/payments/razorpay/config') return send(res, 200, publicPaymentConfig());
   if (req.method === 'GET' && url.pathname === '/api/notes') {
     hydrateNoteMetadata(data);
+    for (const note of data.notes.filter(item => item.mimeType === 'application/pdf').slice(0, NOTE_WARM_LIMIT)) warmNotePages(note);
     return send(res, 200, { notes: data.notes.map(publicNote) });
   }
   const fileMatch = url.pathname.match(/^\/api\/notes\/([^/]+)\/file$/);
@@ -468,6 +494,7 @@ async function api(req, res) {
     if (previewOnly && !ownsNote(user, note) && pageNumber > 5) return send(res, 403, { error: 'Only the first 5 preview pages are available before purchase.' });
     const renderedPage = await renderPdfPage(note, pageNumber, previewOnly);
     if (!renderedPage) return send(res, 503, { error: 'This preview page is still being prepared. Please try again in a moment.' });
+    warmNextPageWindow(note, pageNumber, previewOnly);
     return pipeFile(res, renderedPage, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }, { missingStatus: 503, missingError: 'This preview page is still being prepared. Please try again in a moment.' });
   }
   if (req.method === 'GET' && url.pathname === '/api/admin/notes') {
@@ -515,6 +542,7 @@ async function api(req, res) {
     fs.writeFileSync(storedFile, bytes);
     const note = { id, course, year, subject: subjectName, title, price: Number(price), fileName, mimeType, extension, pageCount: mimeType === 'application/pdf' ? null : 1, uploadedBy: user.id, uploadedAt: new Date().toISOString() };
     if (mimeType === 'application/pdf') note.pageCount = readPdfPageCount(note);
+    if (mimeType === 'application/pdf') warmNotePages(note);
     data.notes.unshift(note); writeData(data);
     return send(res, 201, { note: publicNote(note) });
   }
