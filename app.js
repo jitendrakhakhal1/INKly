@@ -117,14 +117,44 @@ function subjectOptionsFor(course, year) {
 }
 
 async function request(url, options = {}) {
-  const response = await fetch(url, {
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    ...options
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Something went wrong.');
+  let response;
+  try {
+    response = await fetch(url, {
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      ...options
+    });
+  } catch (error) {
+    const networkError = new Error('Could not reach the Inkly server. Please wait a moment and try again.');
+    networkError.retryable = true;
+    throw networkError;
+  }
+  let data = {};
+  try {
+    data = await response.json();
+  } catch (_) {
+    data = {};
+  }
+  if (!response.ok) {
+    const responseError = new Error(data.error || 'Something went wrong.');
+    responseError.retryable = response.status >= 500;
+    throw responseError;
+  }
   return data;
+}
+
+async function requestWithRetry(url, options = {}, retries = 2) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await request(url, options);
+    } catch (error) {
+      lastError = error;
+      if (!error.retryable) throw error;
+      if (attempt < retries) await new Promise(resolve => setTimeout(resolve, 800 * (attempt + 1)));
+    }
+  }
+  throw lastError;
 }
 
 function escapeHtml(value) {
@@ -175,7 +205,7 @@ async function loadNotes() {
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const result = await request('/api/notes');
+      const result = await requestWithRetry('/api/notes', {}, 1);
       state.notes = result.notes || [];
       state.notesLoading = false;
       state.notesError = '';
@@ -318,12 +348,11 @@ async function submitAuth(e) {
       const result = await request('/api/signup', { method: 'POST', body: JSON.stringify({ name, email, password }) });
       setUser(result.user);
     } else {
-      const result = await request('/api/login', { method: 'POST', body: JSON.stringify({ email, password }) });
+      const result = await requestWithRetry('/api/login', { method: 'POST', body: JSON.stringify({ email, password }) });
       setUser(result.user);
     }
-    await loadNotes();
-    if (state.notesError) toast(state.notesError);
     go('select');
+    refreshNotesIfNeeded(true);
   } catch (error) {
     toast(error.message);
   }
@@ -1272,7 +1301,7 @@ function render() {
 
 async function start() {
   try {
-    const result = await request('/api/me');
+    const result = await requestWithRetry('/api/me', {}, 1);
     if (result.user) {
       setUser(result.user);
       await loadNotes();
@@ -1280,7 +1309,8 @@ async function start() {
       state.screen = 'select';
     }
   } catch (_) {
-    toast('Start Inkly with npm start, then open http://localhost:3000.');
+    const local = ['localhost', '127.0.0.1', ''].includes(window.location.hostname);
+    toast(local ? 'Start Inkly with npm start, then open http://localhost:3000.' : 'Inkly is waking up. Please refresh once in a moment.');
   }
   render();
 }

@@ -337,6 +337,7 @@ function pipeFile(res, file, headers, options = {}) {
 function hydrateNoteMetadata(data) {
   let changed = false;
   for (const note of data.notes) {
+    if (note.mimeType === 'application/pdf' && Number(note.pageCount) > 0) continue;
     const nextPageCount = note.mimeType === 'application/pdf' ? readPdfPageCount(note) : 1;
     if (nextPageCount && note.pageCount !== nextPageCount) {
       note.pageCount = nextPageCount;
