@@ -143,7 +143,7 @@ async function request(url, options = {}) {
   return data;
 }
 
-async function requestWithRetry(url, options = {}, retries = 2) {
+async function requestWithRetry(url, options = {}, retries = 4) {
   let lastError = null;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
@@ -151,7 +151,9 @@ async function requestWithRetry(url, options = {}, retries = 2) {
     } catch (error) {
       lastError = error;
       if (!error.retryable) throw error;
-      if (attempt < retries) await new Promise(resolve => setTimeout(resolve, 800 * (attempt + 1)));
+      // A Render service can need a few seconds to wake after inactivity. Keep
+      // retrying safe requests with a short capped backoff before showing an error.
+      if (attempt < retries) await new Promise(resolve => setTimeout(resolve, Math.min(1000 * (2 ** attempt), 8000)));
     }
   }
   throw lastError;
@@ -398,13 +400,13 @@ function forgotPassword() {
 async function resetPassword(e) {
   e.preventDefault();
   try {
-    const result = await request('/api/reset-password', {
+    const result = await requestWithRetry('/api/reset-password', {
       method: 'POST',
       body: JSON.stringify({
         email: document.querySelector('#reset-email').value.trim(),
         password: document.querySelector('#reset-password').value
       })
-    });
+    }, 4);
     setUser(result.user);
     await loadNotes();
     if (state.notesError) toast(state.notesError);
@@ -1301,7 +1303,7 @@ function render() {
 
 async function start() {
   try {
-    const result = await requestWithRetry('/api/me', {}, 1);
+    const result = await requestWithRetry('/api/me', {}, 4);
     if (result.user) {
       setUser(result.user);
       await loadNotes();
